@@ -7,7 +7,7 @@ editor_options:
   chunk_output_type: console
 ---
 
-```{r setup, include=FALSE}
+```{r setup, include = FALSE}
 knitr::knit_hooks$set(
   margin = function(before, options, envir) {
     if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.109, .97, .15, .97))
@@ -67,15 +67,15 @@ srf <- c("hmp",   # prison
          "nfa")   # homeless
 ```
 
-Loading the data sets from the files `data_for_marc_1.xlsx` and
-`data_for_marc_3.xlsx`:
+Loading the data sets from the files `dataset1.xlsx` and
+`dataset3.xlsx`:
 
 ```{r}
-bmg1 <- "data_for_marc_1.xlsx" %>%
+bmg1 <- "dataset1.xlsx" %>%
   read_excel() %>% 
   mutate_at(srf, as.logical) # no NA is these variables
 
-bmg3 <- "data_for_marc_3.xlsx" %>%
+bmg3 <- "dataset3.xlsx" %>%
   read_excel() %>% 
   mutate_at(srf, ~ .x %>%
               na_if("Unknown") %>% # assumes that "Unknown" = NA
@@ -231,7 +231,7 @@ bmg %>%
 ### Data with 12 SNP
 
 ```{r}
-bmg1_12 <- "data_for_marc_1_snps12.xlsx" %>%
+bmg1_12 <- "dataset1_snps12.xlsx" %>%
   read_excel() %>% 
   mutate_at(srf, as.logical) %>% 
   select(-`_merge`)
