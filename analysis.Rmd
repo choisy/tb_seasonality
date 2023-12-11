@@ -1,0 +1,2664 @@
+---
+title: "_Mycobacterium tuberculosis_ transmission in Birmingham, UK, 2009-19: a prospective observational study"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::knit_hooks$set(
+  margin = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.109, .97, .15, .97))
+    else NULL
+  })
+
+knitr::opts_chunk$set(margin     = TRUE, 
+                      echo       = TRUE,
+                      message    = FALSE,
+                      warning    = FALSE,
+                      dev.args   = list(pointsize = 12),
+                      fig.height = 3.5,
+                      fig.width  = 4.24725,
+                      fig.retina = 2,
+                      fig.align  = "center")
+```
+
+## Packages and functions
+
+```{r}
+library(survival)
+library(car)
+library(grid)
+library(pscl)
+library(segmented)
+library(readxl)
+library(lubridate)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(magrittr) # safer to load in penultimate position
+library(dplyr)    # safer to load in last position
+```
+
+A function that does the likelihood ratio test (LRT):
+
+```{r}
+lrt <- function(...) anova(..., test = "LRT")
+```
+
+A tuning of the `diff()` function:
+
+```{r}
+diff2 <- function(x, ...) c(diff(x, ...), NA)
+```
+
+## Preparing the data
+
+### Data with 5 SNP
+
+Social risk factors:
+
+```{r}
+srf <- c("hmp",   # prison
+         "etoh",  # alcoholic
+         "drugs", # drug user
+         "nfa")   # homeless
+```
+
+Loading the data sets from the files `data_for_marc_1.xlsx` and
+`data_for_marc_3.xlsx`:
+
+```{r}
+bmg1 <- "data_for_marc_1.xlsx" %>%
+  read_excel() %>% 
+  mutate_at(srf, as.logical) # no NA is these variables
+
+bmg3 <- "data_for_marc_3.xlsx" %>%
+  read_excel() %>% 
+  mutate_at(srf, ~ .x %>%
+              na_if("Unknown") %>% # assumes that "Unknown" = NA
+              equals("Yes")) 
+```
+
+Let's compare `bmg1` and `bmg3` with some basic checks. Checking for the
+presence of duplicated IDs:
+
+```{r}
+any(table(bmg1$id) > 1)
+any(table(bmg3$id) > 1)
+```
+
+Checking that the exact same sets of IDs are used for the 2 data sets:
+
+```{r}
+identical(sort(bmg1$id), sort(bmg3$id))
+```
+
+Are there any variables that have have different values in the two data sets:
+
+```{r}
+intsct <- setdiff(intersect(names(bmg1), names(bmg3)), "id")
+intsct_1 <- paste0(intsct, ".1")
+intsct_3 <- paste0(intsct, ".3")
+
+bmg13 <- bmg3 %>% 
+  mutate_at(srf, replace_na, FALSE) %>% 
+  left_join(bmg1, "id", suffix = c(".3", ".1"))
+
+(difrt <- intsct[which(! map2_lgl(bmg13[, intsct_1], bmg13[, intsct_3], identical))])
+```
+
+Thus, the variable `lineage` seems to have different values in the two data sets:
+
+```{r}
+if (length(difrt)) {
+  show_differences <- function(x, y) {
+    X <- bmg13[[x]]
+    Y <- bmg13[[y]]
+    bmg13[is.na(X - Y) | (X != Y), c("id", x, y)]
+  }
+  map2(paste0(difrt, ".1"), paste0(difrt, ".3"), show_differences)
+}
+```
+
+From these observations, let's merge `bmg1` and `bmg3`, taking `bmg3` as a
+reference (i.e. with a missing lineage):
+
+```{r}
+bmg <- bmg3 %>% 
+  select(c("id", setdiff(names(bmg3), names(bmg1)))) %>% 
+  left_join(bmg1, "id") %>% 
+  rename(prison    = hmp,
+         alcohol   = etoh,
+         homeless  = nfa,
+         post_code = pc) %>% 
+  mutate(date      = as_date(firstsample),
+         sex       = c("female", "male")[mf],
+         lineage   = na_if(lineage, 10),
+         born      = ifelse(ukb == "Not known", NA, c("uk", "os1", "os2")[imstat + 1])) %>% 
+  mutate_at(vars(index2y, cluster, pul), as.logical) %>% 
+  mutate_at(vars(id, cluster_number, lineage, post_code), as.integer) %>% 
+  select(id, post_code, date, sex, born, pul, prison, alcohol, homeless, drugs,
+         cluster, cluster_number, lineage)
+```
+
+Adding the variables `start` and `chronorder` used for generating figure 2:
+
+```{r}
+bmg %<>% 
+  group_by(cluster_number) %>% 
+  summarise(start = min(date)) %>%
+  mutate(chronorder = rank(start, ties = "first")) %>% 
+  left_join(bmg, ., "cluster_number")
+```
+
+Adding `time` and `status` for the survival analyses:
+
+```{r}
+end_of_data <- max(bmg$date)
+bmg %<>% 
+  arrange(date) %>% 
+  group_by(cluster_number) %>% 
+  group_map(~ mutate(.x, time = diff2(as.numeric(date))), .keep = TRUE) %>% 
+  bind_rows() %>% 
+  mutate(status          = !is.na(time),
+         time            = ifelse(status, time, end_of_data - date),
+         no_other_factor = !(prison | alcohol | homeless | drugs))
+```
+
+Adding the number of social risk factors:
+
+```{r}
+bmg %<>% mutate(srf = prison + alcohol + homeless + drugs)
+```
+
+Final version of the data set that merges `bmg1` and `bmg3` is thus:
+
+```{r}
+bmg
+```
+
+Now we want to verify the `cluster` variable. Here we compute from scratch the
+set of IDs that belong to a cluster:
+
+```{r}
+in_a_cluster1 <- bmg %>% 
+  group_by(cluster_number) %>% 
+  tally() %>% 
+  filter(n > 1) %>% 
+  pull(cluster_number)
+```
+
+This is the set of IDs reported in the data set to belong to a cluster:
+
+```{r}
+in_a_cluster2 <- bmg %>%
+  filter(cluster) %>% 
+  pull(cluster_number) %>% 
+  unique()
+```
+
+We can verify that this 2 sets are identical:
+
+```{r}
+identical(in_a_cluster1, in_a_cluster2)
+```
+
+Next, we want to verify that there is only one lineage per cluster:
+
+```{r}
+bmg %>% 
+  group_by(lineage, cluster_number) %>% 
+  tally() %>% 
+  pivot_wider(names_from = lineage, values_from = n) %>% 
+  mutate_all(replace_na, 0) %>% 
+  mutate_at(vars(`1`, `2`, `3`, `4`, `NA`), as.logical) %>% 
+  mutate(s = `1` + `2` + `3` + `4` + `NA`) %>% 
+  filter(s > 1)
+```
+
+All good. Now confirming that there is one lineage missing value (ID 5636) in
+the cluster number 27:
+
+```{r}
+bmg %>%
+  filter(is.na(lineage)) %>% 
+  select(id, cluster_number, lineage)
+```
+
+### Data with 12 SNP
+
+```{r}
+bmg1_12 <- "data_for_marc_1_snps12.xlsx" %>%
+  read_excel() %>% 
+  mutate_at(srf, as.logical) %>% 
+  select(-`_merge`)
+```
+
+```{r}
+bmg_12 <- bmg3 %>% 
+  select(c("id", setdiff(names(bmg3), names(bmg1_12)))) %>% 
+  left_join(bmg1_12, "id") %>% 
+  rename(prison    = hmp,
+         alcohol   = etoh,
+         homeless  = nfa,
+         post_code = pc) %>% 
+  mutate(date      = as_date(firstsample),
+         sex       = c("female", "male")[mf],
+         lineage   = na_if(lineage, 10),
+         born      = ifelse(ukb == "Not known", NA, c("uk", "os1", "os2")[imstat + 1])) %>% 
+  mutate_at(vars(index2y, cluster, pul), as.logical) %>% 
+  mutate_at(vars(id, cluster_number, lineage, post_code), as.integer) %>% 
+  select(id, post_code, date, sex, born, pul, prison, alcohol, homeless, drugs,
+         cluster, cluster_number, lineage)
+```
+
+```{r}
+bmg_12 %<>% 
+  group_by(cluster_number) %>% 
+  summarise(start = min(date)) %>%
+  mutate(chronorder = rank(start, ties = "first")) %>% 
+  left_join(bmg_12, ., "cluster_number")
+```
+
+```{r}
+end_of_data <- max(bmg_12$date)
+bmg_12 %<>% 
+  arrange(date) %>% 
+  group_by(cluster_number) %>% 
+  group_map(~ mutate(.x, time = diff2(as.numeric(date))), .keep = TRUE) %>% 
+  bind_rows() %>% 
+  mutate(status          = !is.na(time),
+         time            = ifelse(status, time, end_of_data - date),
+         no_other_factor = !(prison | alcohol | homeless | drugs))
+```
+
+```{r}
+bmg_12 %<>% mutate(srf = prison + alcohol + homeless + drugs)
+```
+
+```{r}
+bmg_12
+```
+
+Let's compare `bmg` and `bmg12`:
+
+```{r}
+table(bmg$cluster, bmg_12$cluster)
+```
+
+### Regenerated data with 12 SNP
+
+Reading the new data set:
+
+```{r}
+bmg1_12b <- "snp12_clusters.xlsx" %>%
+  read_excel() %>% 
+  setNames(c("id", "date", "cluster_number")) %>% 
+  mutate(id = as.integer(id),
+         date = as_date(date),
+         cluster_number = as.integer(cluster_number))
+```
+
+Checking consistency on the date:
+
+```{r}
+bmg %>% 
+  select(id, date) %>% 
+  left_join(select(bmg1_12b, id, date), "id") %>% 
+  mutate(dff = date.x - date.y) %>% 
+  pull(dff) %>% 
+  unique()
+```
+
+The cluster ID that actually correspond to actual clusters:
+
+```{r}
+in_cluster <- bmg1_12b %>% 
+  group_by(cluster_number) %>% 
+  tally() %>% 
+  filter(n > 1) %>% 
+  pull(cluster_number)
+```
+
+```{r}
+new_cluster <- bmg1_12b %>% 
+  mutate(cluster2 = as.numeric(cluster_number %in% in_cluster)) %>% 
+  select(id, cluster2)
+```
+
+```{r}
+bmg1_12b <- bmg1_12 %>% 
+  left_join(new_cluster, "id") %>% 
+  mutate(cluster = cluster2) %>% 
+  select(-cluster2)
+```
+
+```{r}
+bmg_12b <- bmg3 %>% 
+  select(c("id", setdiff(names(bmg3), names(bmg1_12b)))) %>% 
+  left_join(bmg1_12b, "id") %>% 
+  rename(prison    = hmp,
+         alcohol   = etoh,
+         homeless  = nfa,
+         post_code = pc) %>% 
+  mutate(date      = as_date(firstsample),
+         sex       = c("female", "male")[mf],
+         lineage   = na_if(lineage, 10),
+         born      = ifelse(ukb == "Not known", NA, c("uk", "os1", "os2")[imstat + 1])) %>% 
+  mutate_at(vars(index2y, cluster, pul), as.logical) %>% 
+  mutate_at(vars(id, cluster_number, lineage, post_code), as.integer) %>% 
+  select(id, post_code, date, sex, born, pul, prison, alcohol, homeless, drugs,
+         cluster, cluster_number, lineage)
+```
+
+```{r}
+bmg_12b %<>% 
+  group_by(cluster_number) %>% 
+  summarise(start = min(date)) %>%
+  mutate(chronorder = rank(start, ties = "first")) %>% 
+  left_join(bmg_12b, ., "cluster_number")
+```
+
+```{r}
+end_of_data <- max(bmg_12b$date)
+bmg_12b %<>% 
+  arrange(date) %>% 
+  group_by(cluster_number) %>% 
+  group_map(~ mutate(.x, time = diff2(as.numeric(date))), .keep = TRUE) %>% 
+  bind_rows() %>% 
+  mutate(status          = !is.na(time),
+         time            = ifelse(status, time, end_of_data - date),
+         no_other_factor = !(prison | alcohol | homeless | drugs))
+```
+
+```{r}
+bmg_12b %<>% mutate(srf = prison + alcohol + homeless + drugs)
+```
+
+```{r}
+bmg_12b
+```
+
+Let's compare `bmg12` and `bmg12b`:
+
+```{r}
+table(bmg_12$cluster, bmg_12b$cluster)
+```
+
+## General findings
+
+Total number of patients:
+
+```{r}
+(nb_patients <- nrow(bmg))
+```
+
+Numbers of male and female:
+
+```{r}
+sex_ratio <- bmg %>% 
+  group_by(sex) %>% 
+  tally() %>% 
+  mutate(perc = round(n / nb_patients, 2))
+
+sex_ratio
+```
+
+Number of missing data on location of birth:
+
+```{r}
+(nb_missing_born <- sum(is.na(bmg$born)))
+```
+
+Corresponding percentage:
+
+```{r}
+round(nb_missing_born / nb_patients, 2)
+```
+
+Number of people born in the UK:
+
+```{r}
+(nb_uk <- sum(bmg$born == "uk", na.rm = TRUE))
+```
+
+Corresponding percentage:
+
+```{r}
+(perc_uk <- round(nb_uk / nb_patients, 2))
+```
+
+Number of people born overseas:
+
+```{r}
+nb_patients - nb_uk - nb_missing_born
+```
+
+Corresponding percentage:
+
+```{r}
+round((nb_patients - nb_uk - nb_missing_born) / nb_patients, 2)
+```
+
+Pulmonary TB:
+
+```{r}
+bmg %>% 
+  group_by(pul) %>% 
+  tally()
+```
+
+Type of TB x born in the UK or not:
+
+```{r}
+tbl <- bmg %>% 
+  mutate(uk = born == "uk") %$% 
+  table(uk, pul) %>% 
+  addmargins()
+
+tbl
+```
+
+Corresponding percentages:
+
+```{r}
+round(100 * tbl[1:2, -3] / tbl[1:2, 3])
+```
+
+Lineages:
+
+```{r}
+bmg %>% 
+  group_by(lineage) %>% 
+  tally()
+```
+
+### Social risk factors, sex and place of birth
+
+Number of patients with a social risk factor:
+
+```{r}
+nb_srf <- bmg %>% 
+  filter(prison | alcohol | homeless | drugs) %>% 
+  nrow()
+
+nb_srf
+```
+
+Number of patients in each of the social risk factors:
+
+```{r}
+bmg %>% 
+  select(prison, alcohol, homeless, drugs) %>% 
+  colSums()
+```
+
+Number of patients per number of social risk factors:
+
+```{r}
+bmg %>% 
+  select(prison, alcohol, homeless, drugs) %>% 
+  rowSums() %>% 
+  table()
+```
+
+Number of patients with a social risk factor and born in the UK:
+
+```{r}
+nb_srf_uk <- bmg %>% 
+  filter((prison | alcohol | homeless | drugs) & born == "uk") %>% 
+  nrow()
+
+nb_srf_uk
+
+round(100 * nb_srf_uk / nb_srf)
+```
+
+Number of patients with a social risk factor and males:
+
+```{r}
+nb_srf_male <- bmg %>% 
+  filter((prison | alcohol | homeless | drugs) & sex == "male") %>% 
+  nrow()
+
+nb_srf_male
+
+round(100 * nb_srf_male / nb_srf)
+```
+
+Venn diagram of the social risk factors:
+
+```{r}
+srf <- c("prison", "alcohol", "homeless", "drugs")
+
+cols <- adjustcolor(RColorBrewer::brewer.pal(4, "Set3"), .5)
+
+grid.newpage()
+
+srf %>%
+  map(~ unlist(bmg[bmg[[.x]], "id"])) %>% 
+  setNames(srf) %>% 
+  VennDiagram::venn.diagram(NULL, fill = cols) %>% 
+  grid.draw()
+```
+
+```{r include = FALSE}
+file.remove(grep("^VennDiagram.*log$", dir(), value = TRUE))
+```
+
+Combining social risk factors and sex and place of birth:
+
+```{r}
+rf <- c("sex", "born", srf)
+```
+
+Only sex and place of birth are independent:
+
+```{r include = FALSE}
+options(scipen = 999)
+```
+
+```{r}
+nb <- length(rf)
+mat <- matrix(0, nb, nb)
+for (i in 1:(nb - 1)) {
+  for (j in (i + 1):nb) {
+    mat[i, j] <- mat[j, i] <- fisher.test(table(bmg[[rf[i]]], bmg[[rf[j]]]))$p.value
+  }
+}
+rownames(mat) <- colnames(mat) <- rf
+
+round(mat, 4)
+```
+
+```{r include = FALSE}
+options(scipen = 0)
+```
+
+Same type of analysis but this time accounting for confoundings. First the
+social risk factors only:
+
+```{r}
+Anova(glm(drugs ~ prison + alcohol + homeless, binomial, bmg))
+Anova(glm(prison ~ drugs + alcohol + homeless, binomial, bmg))
+Anova(glm(alcohol ~ drugs + prison + homeless, binomial, bmg))
+Anova(glm(homeless ~ drugs + prison + alcohol, binomial, bmg))
+```
+
+Same thing, with `sex` and `uk` in addition:
+
+```{r}
+tmp <- mutate(bmg, uk = born == "uk")
+Anova(glm(drugs ~ prison + alcohol + homeless + sex + uk, binomial, tmp))
+Anova(glm(prison ~ drugs + alcohol + homeless + sex + uk, binomial, tmp))
+Anova(glm(alcohol ~ drugs + prison + homeless + sex + uk, binomial, tmp))
+Anova(glm(homeless ~ drugs + prison + alcohol + sex + uk, binomial, tmp))
+```
+
+### Clusters
+
+Number of patients in a cluster (versus not):
+
+```{r}
+nb_clst <- bmg %>% 
+  group_by(cluster) %>% 
+  tally()
+
+nb_clst
+```
+
+Confirming above result, sex and place of birth are independent but social risk
+factors have a significant effect on both of them, namely males and those born
+in the UK are more associated with social risk factors:
+
+```{r}
+summary(glm(sex == "male" ~ born == "uk", binomial, bmg))
+summary(glm(sex == "male" ~ prison | alcohol | homeless | drugs, binomial, bmg))
+summary(glm(born == "uk" ~ prison | alcohol | homeless | drugs, binomial, bmg))
+```
+
+Sex is not associated with the likelihood of the case to be part of a cluster
+but social risk factor and being born in the UK both significantly increase the
+likelihood to be part of a cluster:
+
+```{r}
+summary(glm(cluster ~ (prison | alcohol | homeless | drugs) + sex, binomial, bmg))
+summary(glm(cluster ~ (prison | alcohol | homeless | drugs) + (born == "uk"), binomial, bmg))
+```
+
+## Temporal trend in case load with 5 SNP
+
+### Preparing monthly incidence data
+
+Let's first transform the data into monthly incidence time series. Because we
+will model potential seasonality with harmonic regression, we also generate cos
+and sine wave with the following function:
+
+```{r}
+wave_trans <- function(x, f = cos) {
+  f(2 * pi * x / 365)
+}
+```
+
+And now the time series data can be produced this way:
+
+```{r}
+bmg_ts <- bmg %>% 
+  mutate(year  = year(date),
+         month = month(date)) %>% 
+  group_by(year, month, cluster) %>% 
+  tally() %>% 
+  ungroup() %>% 
+  mutate(date    = ymd(paste(year, month, "1")),
+         date2   = as.integer(date),
+         cosdate = wave_trans(date2, cos),
+         sindate = wave_trans(date2, sin))
+```
+
+Which looks like:
+
+```{r}
+bmg_ts
+```
+
+### Poisson model
+
+Let's consider some Poisson models with various options for the interactions:
+
+```{r}
+# no interactions:
+mod_pois1 <- glm(n ~ date2 + cluster + cosdate + sindate, poisson, bmg_ts)
+# interaction between seasonality and cluster:
+mod_pois2 <- update(mod_pois1, . ~ . + cosdate : cluster + sindate : cluster)
+# interaction between trend and cluster:
+mod_pois3 <- update(mod_pois1, . ~ . + date2 : cluster)
+# interactions between seasonality and cluster, as well as between trend and cluster:
+mod_pois4 <- update(mod_pois2, . ~ . + date2 : cluster)
+```
+
+Let's compare these models:
+
+```{r}
+lrt(mod_pois1, mod_pois2, mod_pois4)
+lrt(mod_pois1, mod_pois3, mod_pois4)
+```
+
+So, the best model would be `mod_pois2` (i.e. interaction between cluster and
+seasonality, but not between cluster and linear trend). Next, let's see whether
+the seasonality is significant for both the cluster and non-cluster:
+
+```{r}
+mod_pois2a <- update(mod_pois1, . ~ . - cluster, data = filter(bmg_ts,  cluster))
+mod_pois2b <- update(mod_pois2a, data = filter(bmg_ts,  !cluster))
+
+test_seasonality <- function(x) {
+  lrt(update(x, . ~ . - cosdate - sindate), x)
+}
+
+test_seasonality(mod_pois2a)
+test_seasonality(mod_pois2b)
+```
+
+Which means that seasonality is significant only for the cluster (`mod_pois2a`).
+Let's thus update this model accordingly:
+
+```{r}
+mod_pois2b %<>% update(. ~ . - cosdate - sindate)
+```
+
+Next, let's look at segmented regressions version of these two models, with
+periods predefined by these dates:
+
+```{r}
+date_1 <- ymd(20110101)
+date_2 <- ymd(20150101)
+```
+
+Let's do the test for the cluster and non cluster:
+
+```{r}
+segmented2 <- function(x, y) {
+  segmented(x, ~ date2, y - 15, control = seg.control(it.max = 0))
+}
+
+test_segments <- function(x) {
+  mod1 <- segmented2(x, date_1)
+  mod2 <- segmented2(x, date_2)
+  mod3 <- segmented2(x, c(date_1, date_2))
+  print(lrt(x, mod1))
+  print(lrt(x, mod2))
+  lrt(mod2, mod3)
+}
+
+test_segments(mod_pois2a)
+test_segments(mod_pois2b)
+```
+
+Which means that there is a change in the trend only for the non-cluster, and
+only after 2015. Let's update model `mod_pois2b` accordingly:
+
+```{r}
+mod_pois2b %<>% segmented2(date_2)
+```
+
+Now we can make a figure. First we need a function that computes predictions
+with confidence intervals from a model:
+
+```{r}
+predict2 <- function(object, newdata, level = .95) {
+  q <- (1 - level) / 2
+  
+  predict(object, newdata, se.fit = TRUE) %>% 
+    magrittr::extract(-3) %>% 
+    as_tibble() %>% 
+    mutate(lwr = fit + qt(q, Inf) * se.fit,
+           upr = fit + qt(1 - q, Inf) * se.fit) %>% 
+    mutate_at(vars(fit, lwr, upr), object$family$linkinv) %>% 
+    cbind(newdata, .)
+}
+```
+
+Let's generate some new data for the covariables used for prediction:
+
+```{r}
+newdata <- tibble(date     = unique(bmg_ts$date)) %>% 
+           mutate(date2    = as.integer(date),
+                  cosdate  = wave_trans(date2, cos),
+                  sindate  = wave_trans(date2, sin),
+                  U1.date2 = date2 - as.numeric(date_2) + 15,
+                  U1.date2 = ifelse(U1.date2 < 0, 0, U1.date2))
+```
+
+Next we need a function that plots the model predictions with confidence
+interval:
+
+```{r}
+arrows2 <- function(...) arrows(..., length = .02, angle = 90, code = 3)
+
+plot_mod_pred <- function(x, color, lwd = 1.5) {
+  with(x, {
+    lines(date, fit, col = color, lwd = lwd)
+    arrows2(date, lwr, date, upr, col = color, lwd = lwd)
+  })
+}
+```
+
+Now that we have these two functions, we can make the figure:
+
+```{r fig.height = 1.7 * 3.5, fig.width  = 1.7 * 4.24725}
+# The data of non cluster:
+bmg_ts %>% 
+  filter(! cluster) %$% 
+  plot(date, n, type = "h", lwd = 3, col = "lightgrey", lend = 1, yaxs = "i",
+       ylim = c(0, 20), xlab = NA, ylab = "monthly incidence (ind.)")
+
+# The data of cluster:
+bmg_ts %>% 
+  filter(cluster) %$% 
+  points(date, n, type = "h", lwd = 3, col = "darkgrey", lend = 1)
+
+# The model of cluster:
+mod_pois2a %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(2)
+
+# The model of non cluster:
+mod_pois2b %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(4)
+
+# The 3 time periods:
+abline(v = c(date_1, date_2) - 15, col = 3, lwd = 2, lty = 2:1)
+
+# The legend:
+lgd <- c("non cluster", "cluster")
+legend2 <- function(...) legend(..., box.col = "white") 
+legend2("top", paste(lgd, "(data)"), fill = c("lightgrey", "darkgrey"))
+legend2("topright", paste(lgd, "(model)"), col = c(4, 2), lty = 1)
+```
+
+### Alternative Figure 1 addressing reviewer 5's comment
+
+On figure 1, replace incidence by incidence rate (reviewer 5).
+
+```{r}
+ons <- readxl::read_excel("ONS-mid-year-population-estimates.xlsx")
+```
+
+```{r}
+bmg_ts2 <- ons %>% 
+  select(Year, Total) %>% 
+  left_join(bmg_ts, ., c("year" = "Year"))
+```
+
+```{r}
+# no interactions:
+mod_pois1_2 <- glm(n ~ date2 + cluster + cosdate + sindate, poisson, bmg_ts2, offset = log(Total))
+# interaction between seasonality and cluster:
+mod_pois2_2 <- update(mod_pois1_2, . ~ . + cosdate : cluster + sindate : cluster)
+# interaction between trend and cluster:
+mod_pois3_2 <- update(mod_pois1_2, . ~ . + date2 : cluster)
+# interactions between seasonality and cluster, as well as between trend and cluster:
+mod_pois4_2 <- update(mod_pois2_2, . ~ . + date2 : cluster)
+```
+
+```{r}
+lrt(mod_pois1_2, mod_pois2_2, mod_pois4_2)
+```
+
+```{r}
+mod_pois2a_2 <- update(mod_pois1_2, . ~ . - cluster, data = filter(bmg_ts2,  cluster))
+mod_pois2b_2 <- update(mod_pois2a_2, data = filter(bmg_ts2,  !cluster))
+
+test_seasonality(mod_pois2a_2)
+```
+
+```{r}
+test_seasonality(mod_pois2b_2)
+```
+
+```{r}
+mod_pois2b_2 %<>% update(. ~ . - cosdate - sindate)
+```
+
+```{r}
+test_segments(mod_pois2a_2)
+```
+
+```{r}
+test_segments(mod_pois2b_2)
+```
+
+```{r}
+mod_pois2b_2 %<>% segmented2(date_2)
+```
+
+```{r}
+newdata2 <- tibble(date     = unique(bmg_ts$date)) %>% 
+            mutate(date2    = as.integer(date),
+                   cosdate  = wave_trans(date2, cos),
+                   sindate  = wave_trans(date2, sin),
+                   U1.date2 = date2 - as.numeric(date_2) + 15,
+                   U1.date2 = ifelse(U1.date2 < 0, 0, U1.date2),
+                   Year     = year(date)) %>% 
+            left_join(select(ons, Year, Total), "Year") %>% 
+            select(-Year)
+```
+
+The figure:
+
+```{r fig.height = 1.7 * 3.5, fig.width  = 1.7 * 4.24725}
+# The data of non cluster:
+bmg_ts %>% 
+  filter(! cluster) %$% 
+  plot(date, n, type = "h", lwd = 3, col = "lightgrey", lend = 1, yaxs = "i",
+       ylim = c(0, 20), xlab = NA, ylab = "monthly incidence (ind.)")
+
+# The data of cluster:
+bmg_ts %>% 
+  filter(cluster) %$% 
+  points(date, n, type = "h", lwd = 3, col = "darkgrey", lend = 1)
+
+# The model of cluster:
+mod_pois2a_2 %>% 
+  predict2(newdata2) %>% 
+  plot_mod_pred(2)
+
+# The model of non cluster:
+mod_pois2b_2 %>% 
+  predict2(newdata2) %>% 
+  plot_mod_pred(4)
+
+# The 3 time periods:
+abline(v = c(date_1, date_2) - 15, col = 3, lwd = 2, lty = 2:1)
+
+# The legend:
+lgd <- c("non cluster", "cluster")
+legend2 <- function(...) legend(..., box.col = "white") 
+legend2("top", paste(lgd, "(data)"), fill = c("lightgrey", "darkgrey"))
+legend2("topright", paste(lgd, "(model)"), col = c(4, 2), lty = 1)
+```
+
+### Alternative Figure 1 addressing reviewer 3's comment
+
+On figure 1, replace the segmented regression by a spline regression (reviewer 3).
+
+```{r}
+library(mgcv)
+```
+
+```{r fig.height = 1.7 * 3.5, fig.width  = 1.7 * 4.24725}
+# The data of non cluster:
+bmg_ts %>% 
+  filter(! cluster) %$% 
+  plot(date, n, type = "h", lwd = 3, col = "lightgrey", lend = 1, yaxs = "i",
+       ylim = c(0, 20), xlab = NA, ylab = "monthly incidence (ind.)")
+
+# The data of cluster:
+bmg_ts %>% 
+  filter(cluster) %$% 
+  points(date, n, type = "h", lwd = 3, col = "darkgrey", lend = 1)
+
+# The model of non cluster:
+bmg_ts %>%
+  filter(! cluster) %>% 
+  gam(n ~ s(date2), poisson, .) %>% 
+#  gam(n ~ s(date2) + s(cosdate) + s(sindate), poisson, .) %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(4)
+
+# The model of cluster:
+bmg_ts %>%
+  filter(cluster) %>% 
+  gam(n ~ s(date2) + s(cosdate) + s(sindate), poisson, .) %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(2)
+
+# The 3 time periods:
+abline(v = c(date_1, date_2) - 15, col = 3, lwd = 2, lty = 2:1)
+
+# The legend:
+lgd <- c("non cluster", "cluster")
+legend2 <- function(...) legend(..., box.col = "white") 
+legend2("top", paste(lgd, "(data)"), fill = c("lightgrey", "darkgrey"))
+legend2("topright", paste(lgd, "(model)"), col = c(4, 2), lty = 1)
+```
+
+### Diagnostics on the Poisson model
+
+Let's look at the dispersion in the residuals
+
+```{r}
+AER::dispersiontest(mod_pois2a)
+AER::dispersiontest(mod_pois2b)
+```
+
+Which comforts us in the choice of a Poisson model. Let's now look at temporal
+autocorrelation in residuals. Below is a function that performs a few checks:
+
+```{r}
+test_autocorr <- function(x) {
+  Residuals <- resid(x)
+  print(summary(lm(Residuals[-length(Residuals)] ~ Residuals[-1])))
+  opar <- par(mfrow = 1:2)
+  plot(Residuals, type = "l", col = 4)
+  abline(h = 0)
+  acf(Residuals, main = NA)
+  par(opar)
+} 
+```
+
+Let's check the models for cluster and non cluster
+
+```{r fig.width  = 2 * 4.24725}
+test_autocorr(mod_pois2a)
+test_autocorr(mod_pois2b)
+```
+
+Everything looks OK!
+
+### Quantifying the decreases in incidence
+
+First we need a function that estimates the rate of decrease in % / year, with
+confidence interval:
+
+```{r}
+est_decrease <- function(x, level = .95) {
+  c(coef(x)["date2"], rev(confint(x, "date2", level))) %>% 
+    multiply_by(365) %>% 
+    x$family$linkinv() %>% 
+    subtract(1, .) %>% 
+    multiply_by(100) %>% 
+    setNames(c("est", "lwr", "upr"))
+}
+```
+
+Let's apply it to all the data:
+
+```{r}
+glm(n ~ date2, poisson, bmg_ts) %>% 
+  est_decrease() %>% 
+  round(2)
+```
+
+Let's apply it the cluster cases
+
+```{r}
+mod_pois2a %>%
+  update(. ~ .  - cosdate - sindate) %>% # we remove the seasonality
+  est_decrease() %>% 
+  round(2)
+```
+
+Let's apply it to the non cluster before 2015:
+
+```{r}
+mod_pois2b %>% 
+  update(. ~ . -U1.date2, data = filter(bmg_ts, ! cluster, date < date_2)) %>% 
+  est_decrease() %>% 
+  round(2)
+```
+
+And to the non cluster after 2015:
+
+```{r}
+mod_pois2b %>% 
+  update(. ~ . -U1.date2, data = filter(bmg_ts, ! cluster, date >= date_2)) %>% 
+  est_decrease() %>% 
+  round(2)
+```
+
+### Risk factors
+
+This function plots temporal trends of proportions by quarter or month:
+
+```{r}
+plot_prop_trends <- function(x, val, ylab, ylim = 0:1, dta = bmg, col = "grey",
+                             f1 = lubridate::quarter, f2 = lubridate::yq) {
+  dta %>% 
+    rename(var = x) %>% 
+    mutate(xxxx  = f1(date),
+           year  = year(date)) %>%
+    group_by(year, xxxx) %>%
+    summarise(yes = sum(var == val),
+              no  = sum(var != val)) %>%
+    ungroup() %>% 
+    mutate(date     = f2(paste(year, xxxx)),
+           prop     = map2(yes, yes + no, prop.test),
+           estimate = map_dbl(prop, extract2, "estimate"),
+           confint  = map(prop, extract2, "conf.int")) %>%
+    unnest_wider(confint, "") %>% 
+    select(date, estimate, confint1, confint2) %$% 
+    plot(date, estimate, ylim = ylim, type = "o",
+         xlab = NA, ylab = ylab, col = col, pch = 19)
+}
+```
+
+The same function but by year:
+
+```{r}
+plot_prop_trends_yr <- function(x, val, ylab, ylim = 0:1, dta = bmg, col = "grey") {
+  dta %>% 
+    rename(var = x) %>% 
+    mutate(year  = year(date)) %>%
+    group_by(year) %>%
+    summarise(yes = sum(var == val),
+              no  = sum(var != val)) %>%
+    ungroup() %>% 
+    mutate(date     = ymd(paste(year, 6, 15)),
+           prop     = map2(yes, yes + no, prop.test),
+           estimate = map_dbl(prop, extract2, "estimate"),
+           confint  = map(prop, extract2, "conf.int")) %>%
+    unnest_wider(confint, "") %>% 
+    select(date, estimate, confint1, confint2) %$% 
+    plot(date, estimate, ylim = ylim, type = "o",
+         xlab = NA, ylab = ylab, col = col, pch = 19)
+}
+```
+
+A function that adds prediction and confidence interval to an existing plot:
+
+```{r}
+add_pred_ci <- function(x, fit, lwr, upr, col = 4, alpha = .2) {
+  polygon(c(x, rev(x)), c(lwr, rev(upr)), border = NA, col = adjustcolor(col, alpha))
+  lines(x, fit, col = col)
+}
+```
+
+Plotting the temporal trends by quarter (left column) and year (right column):
+
+```{r fig.height = 4 * 3.5, fig.width  = 2 * 4.24725}
+opar <- par(mfrow = c(4, 2), cex = 1)
+
+# 1. Temporal trend of the proportion of males:
+newdata3 <- tibble(date = seq(min(bmg$date), max(bmg$date), 1))
+
+plot_prop_trends("sex", "male", "proportion of male")
+
+glm(sex == "male" ~ date, binomial, bmg) %>% 
+  predict2(newdata3) %>% 
+  with(add_pred_ci(date, fit, lwr, upr))
+
+abline(h = .5)
+abline(h = select(filter(sex_ratio, sex == "male"), perc), lty = 2)
+
+# 2. The same, by year:
+plot_prop_trends_yr("sex", "male", "proportion of male")
+
+glm(sex == "male" ~ date, binomial, bmg) %>% 
+  predict2(newdata3) %>% 
+  with(add_pred_ci(date, fit, lwr, upr))
+
+abline(h = .5)
+abline(h = select(filter(sex_ratio, sex == "male"), perc), lty = 2)
+
+# 3. Temporal trend of the proportion born in the UK:
+tmp <- mutate(bmg, born = replace_na(born, "uk"))
+
+plot_prop_trends("born", "uk", "proportion UK born", ylim = 0:1, dta = tmp)
+
+glm(born == "uk" ~ date, binomial, tmp) %>% 
+  predict2(newdata3) %>% 
+  with(add_pred_ci(date, fit, lwr, upr))
+
+abline(h = perc_uk, lty = 2)
+
+# 4. The same, by year:
+plot_prop_trends_yr("born", "uk", "proportion UK born", ylim = 0:1,
+                    dta = mutate(bmg, born = replace_na(born, "uk")))
+
+glm(born == "uk" ~ date, binomial, tmp) %>% 
+  predict2(newdata3) %>% 
+  with(add_pred_ci(date, fit, lwr, upr))
+
+abline(h = perc_uk, lty = 2)
+
+# 5. Temporal trend of the proportion in clusters:
+plot_prop_trends("cluster", TRUE, "proportion in cluster")
+
+glm(cluster ~ date, binomial, bmg) %>% 
+  predict2(newdata3) %>% 
+  with(add_pred_ci(date, fit, lwr, upr))
+
+abline(h = nb_clst$n[2] / sum(nb_clst$n), lty = 2)
+
+# 6. The same, by year:
+plot_prop_trends_yr("cluster", TRUE, "proportion in cluster")
+
+glm(cluster ~ date, binomial, bmg) %>% 
+  predict2(newdata3) %>% 
+  with(add_pred_ci(date, fit, lwr, upr))
+
+abline(h = nb_clst$n[2] / sum(nb_clst$n), lty = 2)
+
+# 7. Temporal trend of the proportion with social risk factors:
+tmp <- mutate(bmg, srf = prison | alcohol | homeless | drugs)
+
+plot_prop_trends("srf", TRUE, "proportion with social risk factors", dta = tmp)
+
+glm(srf ~ date, binomial, tmp) %>% 
+  predict2(newdata3) %>% 
+  with(add_pred_ci(date, fit, lwr, upr))
+
+abline(h = sum(tmp$srf) / nrow(tmp), lty = 2)
+
+# 8. The same, by year:
+plot_prop_trends_yr("srf", TRUE, "proportion with social risk factors", dta = tmp)
+
+glm(srf ~ date, binomial, tmp) %>% 
+  predict2(newdata3) %>% 
+  with(add_pred_ci(date, fit, lwr, upr))
+
+abline(h = sum(tmp$srf) / nrow(tmp), lty = 2)
+
+par(opar)
+```
+
+Let's test these trends:
+
+```{r}
+Anova(glm(drugs ~ date + prison + alcohol + homeless, binomial, bmg))
+Anova(glm(prison ~ date + drugs + alcohol + homeless, binomial, bmg))
+Anova(glm(alcohol ~ date + drugs + prison + homeless, binomial, bmg))
+Anova(glm(homeless ~ date + drugs + prison + alcohol, binomial, bmg))
+```
+
+Which means that, among these social risk factors, drug usage seems to be the
+main driver of the increasing trend.
+
+```{r}
+summary(glm(srf ~ date, binomial, tmp))
+```
+
+### Relationship between proportions of male and social risk factors
+
+No relationship between being born in the UK and sex of the patient:
+
+```{r}
+bmg %>% 
+  transmute(imm   = born != "uk",
+            sex   = sex == "male") %$%
+  fisher.test(imm, sex)
+```
+
+```{r}
+bmg %>% 
+  filter(born != "uk") %>% 
+  transmute(born = born == "os1",
+            sex  = sex == "male") %$% 
+  fisher.test(sex, born)
+```
+
+```{r}
+bmg %>% 
+  filter(born != "uk") %>% 
+  transmute(born = born == "os1",
+            sex  = sex == "male") %>% 
+  table() %>% 
+  addmargins()
+```
+
+Still increase of males proportion with time, even after correcting for SRF:
+
+```{r}
+mod <- bmg %>% 
+  transmute(year  = year(date),
+            srf   = prison | alcohol | homeless | drugs,
+            sex   = sex == "male") %$% 
+  glm(sex ~ srf + year, binomial)
+
+summary(mod)
+
+anova(mod, test = "LRT")
+```
+
+```{r}
+ukentry <- readr::read_csv("ukentry_date.csv")
+```
+
+```{r}
+ukentry %>% 
+  select(id, ukent) %>% 
+  left_join(bmg, ., "id") %>% 
+  select(id, date, ukent, sex, born) %>% 
+  filter(born != "uk", is.na(ukent)) %>% 
+  pull(born) %>% 
+  unique()
+```
+
+```{r}
+tmp <- ukentry %>% 
+  select(id, ukent) %>% 
+  left_join(bmg, ., "id") %>% 
+  select(date, ukent, sex) %>% 
+  filter(! is.na(ukent)) %>% 
+  mutate(interval = year(date) - ukent) %>% 
+  select(sex, interval)
+```
+
+```{r}
+with(tmp, plot(jitter(as.numeric(sex == "male")), interval))
+```
+
+```{r}
+with(tmp, plot(jitter(as.numeric(sex == "male")), log(interval + .1)))
+```
+
+```{r}
+hist(tmp$interval)
+```
+
+```{r}
+tmp2 <- tmp %>% 
+  mutate(int2 = cut(interval, c(seq(0, 60, 5), 100), include.lowest = TRUE)) %>% 
+  group_by(int2) %>% 
+  summarise(n     = n(),
+            males = sum(sex == "male")) %>% 
+  mutate(ptest = map2(males, n, prop.test),
+         prop  = map_dbl(ptest, extract2, "estimate"),
+         ci    = map(ptest, extract2, "conf.int"),
+         lower = map_dbl(ci, extract, 1),
+         upper = map_dbl(ci, extract, 2),
+         int2  = str_remove_all(int2, "\\(|\\]|\\[")) %>% 
+  separate(int2, c("lb", "ub")) %>% 
+  mutate_at(c("lb", "ub"), as.numeric) %>% 
+  mutate(xs = (lb + ub) / 2)
+```
+
+```{r}
+with(tmp2, {
+  plot(xs, prop, ylim = 0:1,
+       xlab = "number of years between entry and infection",
+       ylab = "proportion of males", col = 4)
+  arrows(xs, lower, xs, upper, .1, 90, 3, 4)
+})
+
+abline(h = .5)
+```
+
+```{r}
+tmp3 <- tmp %>% 
+  mutate(int2 = cut(interval, seq(0, 80, 5), include.lowest = TRUE)) %>% 
+  group_by(int2) %>% 
+  summarise(n     = n(),
+            males = sum(sex == "male")) %>% 
+  mutate(n     = cumsum(n),
+         males = cumsum(males)) %>% 
+  mutate(ptest = map2(males, n, prop.test),
+         prop  = map_dbl(ptest, extract2, "estimate"),
+         ci    = map(ptest, extract2, "conf.int"),
+         lower = map_dbl(ci, extract, 1),
+         upper = map_dbl(ci, extract, 2),
+         int2  = str_remove_all(int2, "\\(|\\]|\\[")) %>% 
+  separate(int2, c("lb", "ub")) %>% 
+  mutate_at(c("lb", "ub"), as.numeric) %>% 
+  mutate(xs = (lb + ub) / 2)
+```
+
+```{r}
+with(tmp3, {
+  plot(xs, prop, ylim = 0:1,
+       xlab = "number of years between entry and infection",
+       ylab = "proportion of males", col = 4)
+  arrows(xs, lower, xs, upper, .1, 90, 3, 4)
+})
+
+abline(h = .5)
+```
+
+```{r}
+foo <- ukentry %>% 
+  select(id, ukent) %>% 
+  left_join(bmg, ., "id") %>% 
+  select(date, ukent, sex) %>% 
+  filter(! is.na(ukent)) %>% 
+  transmute(year     = year(date),
+            interval = year - ukent)
+```
+
+```{r}
+with(foo, plot(jitter(year), interval))
+```
+
+```{r}
+foo %>% 
+  group_by(year) %>% 
+  summarise(n     = n(),
+            below = sum(interval <= 2)) %>% 
+  mutate(ptest = map2(below, n, prop.test),
+         prop  = map_dbl(ptest, extract2, "estimate"),
+         ci    = map(ptest, extract2, "conf.int"),
+         lower = map_dbl(ci, extract, 1),
+         upper = map_dbl(ci, extract, 2)) %>% 
+  with({
+    plot(year, prop, ylim = 0:1,xlab = NA,
+         ylab = "proportion of recent entries (< 2 years)", col = 4)
+    arrows(year, lower, year, upper, .1, 90, 3, 4)
+  })
+```
+
+```{r}
+mod <- ukentry %>% 
+  select(id, ukent) %>% 
+  left_join(bmg, ., "id") %>% 
+  select(date, ukent, sex) %>% 
+  filter(! is.na(ukent)) %>% 
+  mutate(year     = year(date),
+         interval = year - ukent,
+         recent   = interval <= 2,
+         male     = sex == "male") %$%
+  glm(male ~ recent + year)
+
+summary(mod)
+
+anova(mod, test = "LRT")
+```
+
+```{r}
+bmg %>% 
+  filter(born != "uk")
+```
+
+```{r}
+ukentry %>% 
+  select(id, ukent) %>% 
+  left_join(bmg, ., "id") %>% 
+  filter(born != "uk") %>% 
+  filter(! is.na(ukent))
+```
+
+
+## Temporal trend in case load with 5 SNP on pulmonary cases only
+
+### Preparing monthly incidence data
+
+```{r}
+bmg_ts_pul <- bmg %>% 
+  filter(pul) %>% 
+  mutate(year  = year(date),
+         month = month(date)) %>% 
+  group_by(year, month, cluster) %>% 
+  tally() %>% 
+  ungroup() %>% 
+  mutate(date    = ymd(paste(year, month, "1")),
+         date2   = as.integer(date),
+         cosdate = wave_trans(date2, cos),
+         sindate = wave_trans(date2, sin))
+```
+
+### Poisson model
+
+Let's consider some Poisson models with various options for the interactions:
+
+```{r}
+# no interactions:
+mod_pois1_pul <- glm(n ~ date2 + cluster + cosdate + sindate, poisson, bmg_ts_pul)
+# interaction between seasonality and cluster:
+mod_pois2_pul <- update(mod_pois1_pul, . ~ . + cosdate : cluster + sindate : cluster)
+# interaction between trend and cluster:
+mod_pois3_pul <- update(mod_pois1_pul, . ~ . + date2 : cluster)
+# interactions between seasonality and cluster, as well as between trend and cluster:
+mod_pois4_pul <- update(mod_pois2_pul, . ~ . + date2 : cluster)
+```
+
+Let's compare these models:
+
+```{r}
+lrt(mod_pois1_pul, mod_pois2_pul, mod_pois4_pul)
+lrt(mod_pois1_pul, mod_pois3_pul, mod_pois4_pul)
+```
+
+So, the best model would (marginally) be `mod_pois2` (i.e. interaction between
+cluster and seasonality, but not between cluster and linear trend). Next, let's
+see whether the seasonality is significant for both the cluster and non-cluster:
+
+```{r}
+mod_pois2a_pul <- update(mod_pois1_pul, . ~ . - cluster, data = filter(bmg_ts_pul,  cluster))
+mod_pois2b_pul <- update(mod_pois2a_pul, data = filter(bmg_ts_pul,  !cluster))
+
+test_seasonality(mod_pois2a_pul)
+test_seasonality(mod_pois2b_pul)
+```
+
+Which means that seasonality is significant only for the cluster (`mod_pois2b`).
+Let's thus update this model accordingly:
+
+```{r}
+mod_pois2b_pul %<>% update(. ~ . - cosdate - sindate)
+```
+
+Next, let's look at segmented regressions version of these two models, with
+periods predefined by these dates. Let's do the test for the cluster and non
+cluster:
+
+```{r}
+test_segments(mod_pois2a_pul)
+test_segments(mod_pois2b_pul)
+```
+
+Which means that there is a marginal change in the trend only for the
+non-cluster, either after 2011 or after 2015, but not both at the same time.
+Let's thus not update model `mod_pois2b`. Now we can make the figure. Let's
+generate some new data for the covariables used for prediction:
+
+```{r}
+newdata_pul <- tibble(date     = unique(bmg_ts_pul$date)) %>% 
+           mutate(date2    = as.integer(date),
+                  cosdate  = wave_trans(date2, cos),
+                  sindate  = wave_trans(date2, sin),
+                  U1.date2 = date2 - as.numeric(date_2) + 15,
+                  U1.date2 = ifelse(U1.date2 < 0, 0, U1.date2))
+```
+
+And now the figure:
+
+```{r fig.height = 1.7 * 3.5, fig.width  = 1.7 * 4.24725}
+# The data of non cluster:
+bmg_ts_pul %>% 
+  filter(! cluster) %$% 
+  plot(date, n, type = "h", lwd = 3, col = "lightgrey", lend = 1, yaxs = "i",
+       ylim = c(0, 20), xlab = NA, ylab = "monthly incidence (ind.)")
+
+# The data of cluster:
+bmg_ts_pul %>% 
+  filter(cluster) %$% 
+  points(date, n, type = "h", lwd = 3, col = "darkgrey", lend = 1)
+
+# The model of cluster:
+mod_pois2a_pul %>% 
+  predict2(newdata_pul) %>% 
+  plot_mod_pred(2)
+
+# The model of non cluster:
+mod_pois2b_pul %>% 
+  predict2(newdata_pul) %>% 
+  plot_mod_pred(4)
+
+# The 3 time periods:
+abline(v = c(date_1, date_2) - 15, col = 3, lwd = 2, lty = 2:1)
+
+# The legend:
+lgd <- c("non cluster", "cluster")
+legend2 <- function(...) legend(..., box.col = "white") 
+legend2("top", paste(lgd, "(data)"), fill = c("lightgrey", "darkgrey"))
+legend2("topright", paste(lgd, "(model)"), col = c(4, 2), lty = 1)
+```
+
+## Temporal trend in case load with 5 SNP on non-pulmonary cases only
+
+### Preparing monthly incidence data
+
+```{r}
+bmg_ts_nonpul <- bmg %>% 
+  filter(!pul) %>% 
+  mutate(year  = year(date),
+         month = month(date)) %>% 
+  group_by(year, month, cluster) %>% 
+  tally() %>% 
+  ungroup() %>% 
+  mutate(date    = ymd(paste(year, month, "1")),
+         date2   = as.integer(date),
+         cosdate = wave_trans(date2, cos),
+         sindate = wave_trans(date2, sin))
+```
+
+### Poisson model
+
+Let's consider some Poisson models with various options for the interactions:
+
+```{r}
+# no interactions:
+mod_pois1_nonpul <- glm(n ~ date2 + cluster + cosdate + sindate, poisson, bmg_ts_nonpul)
+# interaction between seasonality and cluster:
+mod_pois2_nonpul <- update(mod_pois1_nonpul, . ~ . + cosdate : cluster + sindate : cluster)
+# interaction between trend and cluster:
+mod_pois3_nonpul <- update(mod_pois1_nonpul, . ~ . + date2 : cluster)
+# interactions between seasonality and cluster, as well as between trend and cluster:
+mod_pois4_nonpul <- update(mod_pois2_nonpul, . ~ . + date2 : cluster)
+```
+
+Let's compare these models:
+
+```{r}
+lrt(mod_pois1_nonpul, mod_pois2_nonpul, mod_pois4_nonpul)
+lrt(mod_pois1_nonpul, mod_pois3_nonpul, mod_pois4_nonpul)
+```
+
+So, the best model would (marginally) be `mod_pois3` (i.e. interaction between
+cluster and linear trend, but not between cluster and seasonality). Next, let's
+see whether the linear trend is significant for both the cluster and non-cluster:
+
+```{r}
+mod_pois2a_nonpul <- update(mod_pois1_nonpul, . ~ . - cluster,
+                            data = filter(bmg_ts_nonpul,  cluster))
+mod_pois2b_nonpul <- update(mod_pois2a_nonpul,
+                            data = filter(bmg_ts_nonpul,  !cluster))
+
+test_lineartrend <- function(x) {
+  lrt(update(x, . ~ . - date2), x)
+}
+
+test_lineartrend(mod_pois2a_nonpul)
+test_lineartrend(mod_pois2b_nonpul)
+```
+
+Which means that linear trend is significant only for the non-cluster
+(`mod_pois2b_nonpul`). Let's thus update this model accordingly:
+
+```{r}
+#mod_pois2a_nonpul %<>% update(. ~ . - date2)
+```
+
+But we still want to test the significance of seasonality for both clustered and
+non-clustered:
+
+```{r}
+mod_pois2a_nonpul2 <- update(mod_pois1_nonpul, . ~ . - cluster,
+                             data = filter(bmg_ts_nonpul, cluster))
+mod_pois2b_nonpul2 <- update(mod_pois2a_nonpul2,
+                             data = filter(bmg_ts_nonpul, !cluster))
+
+test_seasonality(mod_pois2a_nonpul)
+test_seasonality(mod_pois2b_nonpul)
+```
+
+which means that seasonality is not significant, neither for the clustered or
+the non-clustered. Thus, let's update the models accordingly:
+
+```{r}
+mod_pois2a_nonpul %<>% update(. ~ . - cosdate - sindate)
+mod_pois2b_nonpul %<>% update(. ~ . - cosdate - sindate)
+```
+
+Next, let's look at segmented regressions version of these two models, with
+periods predefined by these dates. Let's do the test for the cluster and non
+cluster:
+
+```{r}
+test_segments <- function(x) {
+  mod1 <- segmented2(x, date_1)
+  mod2 <- segmented2(x, date_2)
+  mod3 <- segmented2(x, c(date_1, date_2))
+  print(lrt(x, mod1))
+  print(lrt(x, mod2))
+  print(lrt(x, mod3))
+  lrt(mod2, mod3)
+}
+
+test_segments(mod_pois2a_nonpul)
+test_segments(mod_pois2b_nonpul)
+```
+
+Which means that there is a significant change in the trend only for the
+non-cluster, but both after 2011 and after 2015. Let's thus update model
+`mod_pois2b_nonpul` accordingly:
+
+```{r}
+mod_pois2b_nonpul %<>% segmented2(c(date_1, date_2))
+```
+
+Now we can make the figure. Let's generate some new data for the covariables
+used for prediction:
+
+```{r}
+newdata_nonpul <- tibble(date     = unique(bmg_ts_nonpul$date)) %>% 
+           mutate(date2    = as.integer(date),
+                  cosdate  = wave_trans(date2, cos),
+                  sindate  = wave_trans(date2, sin),
+                  U1.date2 = date2 - as.numeric(date_1) + 11,
+                  U1.date2 = ifelse(U1.date2 < 0, 0, U1.date2),
+                  U2.date2 = date2 - as.numeric(date_2) + 15,
+                  U2.date2 = ifelse(U2.date2 < 0, 0, U2.date2))
+```
+
+And now the figure:
+
+```{r fig.height = 1.7 * 3.5, fig.width  = 1.7 * 4.24725}
+# The data of non cluster:
+bmg_ts_nonpul %>% 
+  filter(! cluster) %$% 
+  plot(date, n, type = "h", lwd = 3, col = "lightgrey", lend = 1, yaxs = "i",
+       ylim = c(0, 20), xlab = NA, ylab = "monthly incidence (ind.)")
+
+# The data of cluster:
+bmg_ts_nonpul %>% 
+  filter(cluster) %$% 
+  points(date, n, type = "h", lwd = 3, col = "darkgrey", lend = 1)
+
+# The model of cluster:
+mod_pois2a_nonpul %>% 
+  predict2(newdata_nonpul) %>% 
+  plot_mod_pred(2)
+
+# The model of non cluster:
+mod_pois2b_nonpul %>% 
+  predict2(newdata_nonpul) %>% 
+  plot_mod_pred(4)
+
+# The 3 time periods:
+abline(v = c(date_1, date_2) - 15, col = 3, lwd = 2, lty = 2:1)
+
+# The legend:
+lgd <- c("non cluster", "cluster")
+legend2 <- function(...) legend(..., box.col = "white") 
+legend2("top", paste(lgd, "(data)"), fill = c("lightgrey", "darkgrey"))
+legend2("topright", paste(lgd, "(model)"), col = c(4, 2), lty = 1)
+```
+
+## Temporal trend in case load with 12 SNP
+
+### Preparing monthly incidence data
+
+```{r}
+bmg_ts_12 <- bmg_12 %>% 
+  mutate(year  = year(date),
+         month = month(date)) %>% 
+  group_by(year, month, cluster) %>% 
+  tally() %>% 
+  mutate(date    = ymd(paste(year, month, "1")),
+         date2   = as.integer(date),
+         cosdate = wave_trans(date2, cos),
+         sindate = wave_trans(date2, sin))
+```
+
+Which looks like:
+
+```{r}
+bmg_ts_12
+```
+
+### Poisson model
+
+Let's consider some Poisson models with various options for the interactions:
+
+```{r}
+# no interactions:
+mod_pois1 <- glm(n ~ date2 + cluster + cosdate + sindate, poisson, bmg_ts_12)
+# interaction between seasonality and cluster:
+mod_pois2 <- update(mod_pois1, . ~ . + cosdate : cluster + sindate : cluster)
+# interaction between trend and cluster:
+mod_pois3 <- update(mod_pois1, . ~ . + date2 : cluster)
+# interactions between seasonality and cluster, as well as between trend and cluster:
+mod_pois4 <- update(mod_pois2, . ~ . + date2 : cluster)
+```
+
+Let's compare these models:
+
+```{r}
+lrt(mod_pois1, mod_pois2, mod_pois4)
+lrt(mod_pois1, mod_pois3, mod_pois4)
+```
+
+So, the best model would be `mod_pois2` (i.e. interaction between cluster and
+seasonality, but not between cluster and linear trend). Next, let's see whether
+the seasonality is significant for both the cluster and non-cluster:
+
+```{r}
+mod_pois2a <- update(mod_pois1, . ~ . - cluster, data = filter(bmg_ts_12,  cluster))
+mod_pois2b <- update(mod_pois2a, data = filter(bmg_ts_12,  !cluster))
+
+test_seasonality(mod_pois2a)
+test_seasonality(mod_pois2b)
+```
+
+Which means that seasonality is significant only for the cluster (`mod_pois2b`).
+Let's thus update this model accordingly:
+
+```{r}
+mod_pois2b %<>% update(. ~ . - cosdate - sindate)
+```
+
+Next, let's look at segmented regressions version of these two models, with
+periods predefined by these dates. Let's do the test for the cluster and non
+cluster:
+
+```{r}
+test_segments(mod_pois2a)
+test_segments(mod_pois2b)
+```
+
+Which means that there is a change in the trend only for the non-cluster, and
+only after 2015. Let's update model `mod_pois2b` accordingly:
+
+```{r}
+mod_pois2b %<>% segmented2(date_2)
+```
+
+Now we can make a figure. First we need a function that computes predictions
+with confidence intervals from a model. Let's generate some new data for the
+covariables used for prediction:
+
+```{r}
+newdata <- tibble(date     = unique(bmg_ts_12$date)) %>% 
+           mutate(date2    = as.integer(date),
+                  cosdate  = wave_trans(date2, cos),
+                  sindate  = wave_trans(date2, sin),
+                  U1.date2 = date2 - as.numeric(date_2) + 15,
+                  U1.date2 = ifelse(U1.date2 < 0, 0, U1.date2))
+```
+
+Next we need a function that plots the model predictions with confidence
+interval. Now that we have these two functions, we can make the figure:
+
+```{r fig.height = 1.7 * 3.5, fig.width  = 1.7 * 4.24725}
+# The data of non cluster:
+bmg_ts_12 %>% 
+  filter(! cluster) %$% 
+  plot(date, n, type = "h", lwd = 3, col = "lightgrey", lend = 1, yaxs = "i",
+       ylim = c(0, 20), xlab = NA, ylab = "monthly incidence (ind.)")
+
+# The data of cluster:
+bmg_ts_12 %>% 
+  filter(cluster) %$% 
+  points(date, n, type = "h", lwd = 3, col = "darkgrey", lend = 1)
+
+# The model of cluster:
+mod_pois2a %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(2)
+
+# The model of non cluster:
+mod_pois2b %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(4)
+
+# The 3 time periods:
+abline(v = c(date_1, date_2) - 15, col = 3, lwd = 2, lty = 2:1)
+
+# The legend:
+lgd <- c("non cluster", "cluster")
+legend2("top", paste(lgd, "(data)"), fill = c("lightgrey", "darkgrey"))
+legend2("topright", paste(lgd, "(model)"), col = c(4, 2), lty = 1)
+```
+
+### Diagnostics on the Poisson model
+
+Let's look at the dispersion in the residuals
+
+```{r}
+AER::dispersiontest(mod_pois2a)
+AER::dispersiontest(mod_pois2b)
+```
+
+Which comforts us in the choice of a Poisson model. Let's now look at temporal
+autocorrelation in residuals. Below is a function that performs a few checks.
+Let's check the models for cluster and non cluster
+
+```{r fig.width  = 2 * 4.24725}
+test_autocorr(mod_pois2a)
+test_autocorr(mod_pois2b)
+```
+
+Everything looks OK!
+
+### Quantifying the decreases in incidence
+
+First we need a function that estimates the rate of decrease in % / year, with
+confidence interval. Let's apply it to all the data:
+
+```{r}
+glm(n ~ date2, poisson, bmg_ts_12) %>% 
+  est_decrease() %>% 
+  round(2)
+```
+
+Let's apply it the cluster cases
+
+```{r}
+mod_pois2a %>%
+  update(. ~ .  - cosdate - sindate) %>% # we remove the seasonality
+  est_decrease() %>% 
+  round(2)
+```
+
+Let's apply it to the non cluster before 2015:
+
+```{r}
+mod_pois2b %>% 
+  update(. ~ . -U1.date2, data = filter(bmg_ts_12, ! cluster, date < date_2)) %>% 
+  est_decrease() %>% 
+  round(2)
+```
+
+And to the non cluster after 2015:
+
+```{r}
+mod_pois2b %>% 
+  update(. ~ . -U1.date2, data = filter(bmg_ts_12, ! cluster, date >= date_2)) %>% 
+  est_decrease() %>% 
+  round(2)
+```
+
+## Temporal trend in case load with regenerated 12 SNP data
+
+### Preparing monthly incidence data
+
+```{r}
+bmg_ts_12b <- bmg_12b %>% 
+  mutate(year  = year(date),
+         month = month(date)) %>% 
+  group_by(year, month, cluster) %>% 
+  tally() %>% 
+  ungroup() %>% 
+  mutate(date    = ymd(paste(year, month, "1")),
+         date2   = as.integer(date),
+         cosdate = wave_trans(date2, cos),
+         sindate = wave_trans(date2, sin))
+```
+
+Which looks like:
+
+```{r}
+bmg_ts_12b
+```
+
+### Poisson model
+
+Let's consider some Poisson models with various options for the interactions:
+
+```{r}
+# no interactions:
+mod_pois1 <- glm(n ~ date2 + cluster + cosdate + sindate, poisson, bmg_ts_12b)
+# interaction between seasonality and cluster:
+mod_pois2 <- update(mod_pois1, . ~ . + cosdate : cluster + sindate : cluster)
+# interaction between trend and cluster:
+mod_pois3 <- update(mod_pois1, . ~ . + date2 : cluster)
+# interactions between seasonality and cluster, as well as between trend and cluster:
+mod_pois4 <- update(mod_pois2, . ~ . + date2 : cluster)
+```
+
+Let's compare these models:
+
+```{r}
+lrt(mod_pois1, mod_pois2, mod_pois4)
+lrt(mod_pois1, mod_pois3, mod_pois4)
+```
+
+So, the best model would be `mod_pois2` (i.e. interaction between cluster and
+seasonality, but not between cluster and linear trend). Next, let's see whether
+the seasonality is significant for both the cluster and non-cluster:
+
+```{r}
+mod_pois2a <- update(mod_pois1, . ~ . - cluster, data = filter(bmg_ts_12b,  cluster))
+mod_pois2b <- update(mod_pois2a, data = filter(bmg_ts_12b,  !cluster))
+
+test_seasonality(mod_pois2a)
+test_seasonality(mod_pois2b)
+```
+
+Which means that seasonality is significant only for the cluster (`mod_pois2b`).
+Let's thus update this model accordingly:
+
+```{r}
+mod_pois2b %<>% update(. ~ . - cosdate - sindate)
+```
+
+Next, let's look at segmented regressions version of these two models, with
+periods predefined by these dates. Let's do the test for the cluster and non
+cluster:
+
+```{r}
+test_segments(mod_pois2a)
+test_segments(mod_pois2b)
+```
+
+Which means that there is a change in the trend only for the non-cluster, and
+only after 2015. Let's update model `mod_pois2b` accordingly:
+
+```{r}
+mod_pois2b %<>% segmented2(date_2)
+```
+
+Now we can make a figure. First we need a function that computes predictions
+with confidence intervals from a model. Let's generate some new data for the
+covariables used for prediction:
+
+```{r}
+newdata <- tibble(date     = unique(bmg_ts_12b$date)) %>% 
+           mutate(date2    = as.integer(date),
+                  cosdate  = wave_trans(date2, cos),
+                  sindate  = wave_trans(date2, sin),
+                  U1.date2 = date2 - as.numeric(date_2) + 15,
+                  U1.date2 = ifelse(U1.date2 < 0, 0, U1.date2))
+```
+
+Next we need a function that plots the model predictions with confidence
+interval. Now that we have these two functions, we can make the figure:
+
+```{r fig.height = 1.7 * 3.5, fig.width  = 1.7 * 4.24725}
+# The data of non cluster:
+bmg_ts_12b %>% 
+  filter(! cluster) %$% 
+  plot(date, n, type = "h", lwd = 3, col = "lightgrey", lend = 1, yaxs = "i",
+       ylim = c(0, 20), xlab = NA, ylab = "monthly incidence (ind.)")
+
+# The data of cluster:
+bmg_ts_12b %>% 
+  filter(cluster) %$% 
+  points(date, n, type = "h", lwd = 3, col = "darkgrey", lend = 1)
+
+# The model of cluster:
+mod_pois2a %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(2)
+
+# The model of non cluster:
+mod_pois2b %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(4)
+
+# The 3 time periods:
+abline(v = c(date_1, date_2) - 15, col = 3, lwd = 2, lty = 2:1)
+
+# The legend:
+lgd <- c("non cluster", "cluster")
+legend2("top", paste(lgd, "(data)"), fill = c("lightgrey", "darkgrey"))
+legend2("topright", paste(lgd, "(model)"), col = c(4, 2), lty = 1)
+```
+
+### Alternative Figure 1 addressing reviewer 5's comment
+
+On figure 1, replace incidence by incidence rate (reviewer 5).
+
+```{r}
+bmg_ts2 <- ons %>% 
+  select(Year, Total) %>% 
+  left_join(bmg_ts_12b, ., c("year" = "Year"))
+```
+
+```{r}
+# no interactions:
+mod_pois1_2 <- glm(n ~ date2 + cluster + cosdate + sindate, poisson, bmg_ts2, offset = log(Total))
+# interaction between seasonality and cluster:
+mod_pois2_2 <- update(mod_pois1_2, . ~ . + cosdate : cluster + sindate : cluster)
+# interaction between trend and cluster:
+mod_pois3_2 <- update(mod_pois1_2, . ~ . + date2 : cluster)
+# interactions between seasonality and cluster, as well as between trend and cluster:
+mod_pois4_2 <- update(mod_pois2_2, . ~ . + date2 : cluster)
+```
+
+```{r}
+lrt(mod_pois1_2, mod_pois2_2, mod_pois4_2)
+```
+
+```{r}
+mod_pois2a_2 <- update(mod_pois1_2, . ~ . - cluster, data = filter(bmg_ts2,  cluster))
+mod_pois2b_2 <- update(mod_pois2a_2, data = filter(bmg_ts2,  !cluster))
+
+test_seasonality(mod_pois2a_2)
+```
+
+```{r}
+test_seasonality(mod_pois2b_2)
+```
+
+```{r}
+mod_pois2b_2 %<>% update(. ~ . - cosdate - sindate)
+```
+
+```{r}
+test_segments(mod_pois2a_2)
+```
+
+```{r}
+test_segments(mod_pois2b_2)
+```
+
+```{r}
+mod_pois2b_2 %<>% segmented2(date_2)
+```
+
+The figure:
+
+```{r fig.height = 1.7 * 3.5, fig.width  = 1.7 * 4.24725}
+# The data of non cluster:
+bmg_ts %>% 
+  filter(! cluster) %$% 
+  plot(date, n, type = "h", lwd = 3, col = "lightgrey", lend = 1, yaxs = "i",
+       ylim = c(0, 20), xlab = NA, ylab = "monthly incidence (ind.)")
+
+# The data of cluster:
+bmg_ts %>% 
+  filter(cluster) %$% 
+  points(date, n, type = "h", lwd = 3, col = "darkgrey", lend = 1)
+
+# The model of cluster:
+mod_pois2a_2 %>% 
+  predict2(newdata2) %>% 
+  plot_mod_pred(2)
+
+# The model of non cluster:
+mod_pois2b_2 %>% 
+  predict2(newdata2) %>% 
+  plot_mod_pred(4)
+
+# The 3 time periods:
+abline(v = c(date_1, date_2) - 15, col = 3, lwd = 2, lty = 2:1)
+
+# The legend:
+lgd <- c("non cluster", "cluster")
+legend2 <- function(...) legend(..., box.col = "white") 
+legend2("top", paste(lgd, "(data)"), fill = c("lightgrey", "darkgrey"))
+legend2("topright", paste(lgd, "(model)"), col = c(4, 2), lty = 1)
+```
+
+### Alternative Figure 1 addressing reviewer 3's comment
+
+On figure 1, replace the segmented regression by a spline regression (reviewer 3).
+
+```{r}
+library(mgcv)
+```
+
+```{r fig.height = 1.7 * 3.5, fig.width  = 1.7 * 4.24725}
+# The data of non cluster:
+bmg_ts_12b %>% 
+  filter(! cluster) %$% 
+  plot(date, n, type = "h", lwd = 3, col = "lightgrey", lend = 1, yaxs = "i",
+       ylim = c(0, 20), xlab = NA, ylab = "monthly incidence (ind.)")
+
+# The data of cluster:
+bmg_ts_12b %>% 
+  filter(cluster) %$% 
+  points(date, n, type = "h", lwd = 3, col = "darkgrey", lend = 1)
+
+# The model of non cluster:
+bmg_ts_12b %>%
+  filter(! cluster) %>% 
+  gam(n ~ s(date2), poisson, .) %>% 
+#  gam(n ~ s(date2) + s(cosdate) + s(sindate), poisson, .) %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(4)
+
+# The model of cluster:
+bmg_ts_12b %>%
+  filter(cluster) %>% 
+  gam(n ~ s(date2) + s(cosdate) + s(sindate), poisson, .) %>% 
+  predict2(newdata) %>% 
+  plot_mod_pred(2)
+
+# The 3 time periods:
+abline(v = c(date_1, date_2) - 15, col = 3, lwd = 2, lty = 2:1)
+
+# The legend:
+lgd <- c("non cluster", "cluster")
+legend2 <- function(...) legend(..., box.col = "white") 
+legend2("top", paste(lgd, "(data)"), fill = c("lightgrey", "darkgrey"))
+legend2("topright", paste(lgd, "(model)"), col = c(4, 2), lty = 1)
+```
+
+### Diagnostics on the Poisson model
+
+Let's look at the dispersion in the residuals
+
+```{r}
+AER::dispersiontest(mod_pois2a)
+AER::dispersiontest(mod_pois2b)
+```
+
+Which comforts us in the choice of a Poisson model. Let's now look at temporal
+autocorrelation in residuals. Below is a function that performs a few checks.
+Let's check the models for cluster and non cluster
+
+```{r fig.width  = 2 * 4.24725}
+test_autocorr(mod_pois2a)
+test_autocorr(mod_pois2b)
+```
+
+Everything looks OK!
+
+### Quantifying the decreases in incidence
+
+First we need a function that estimates the rate of decrease in % / year, with
+confidence interval. Let's apply it to all the data:
+
+```{r}
+glm(n ~ date2, poisson, bmg_ts_12b) %>% 
+  est_decrease() %>% 
+  round(2)
+```
+
+Let's apply it the cluster cases
+
+```{r}
+mod_pois2a %>%
+  update(. ~ .  - cosdate - sindate) %>% # we remove the seasonality
+  est_decrease() %>% 
+  round(2)
+```
+
+Let's apply it to the non cluster before 2015:
+
+```{r}
+mod_pois2b %>% 
+  update(. ~ . -U1.date2, data = filter(bmg_ts_12b, ! cluster, date < date_2)) %>% 
+  est_decrease() %>% 
+  round(2)
+```
+
+And to the non cluster after 2015:
+
+```{r}
+mod_pois2b %>% 
+  update(. ~ . -U1.date2, data = filter(bmg_ts_12b, ! cluster, date >= date_2)) %>% 
+  est_decrease() %>% 
+  round(2)
+```
+
+## Transmission
+
+The number of cluster, samples and proportion of samples per cluster size:
+
+```{r}
+clust_dist <- bmg %>% 
+  group_by(cluster_number) %>% 
+  summarise(cluster_size = n()) %>% 
+  group_by(cluster_size) %>% 
+  summarise(nb_cluster = n()) %>% 
+  mutate(nb_samples = nb_cluster * cluster_size,
+         pc_samples = round(100 * nb_samples / nrow(bmg), 2))
+
+clust_dist
+```
+
+The number and proportion of samples in a cluster of at least 9 samples:
+
+```{r}
+clust_dist %>% 
+  filter(cluster_size > 9) %>% 
+  select(nb_samples, pc_samples) %>% 
+  colSums()
+```
+
+The following function computes the number of samples in a cluster (a cluster
+being defined as at least 2 samples):
+
+```{r}
+nb_clustered <- function(x) {
+  x %>% 
+    group_by(cluster_number) %>% 
+    tally() %>% 
+    group_by(n) %>% 
+    tally() %>% 
+    filter(n > 1) %$% 
+    sum(n * nn)
+}
+```
+
+Computing the total number `N` of samples and the number of `n` of samples in a
+cluster per lineage (rows), as well as the corresponding proportions of these
+samples in a cluster:
+
+```{r}
+tmp <- map(c(nb_clustered, nrow), ~ map_int(group_split(bmg, lineage), .x)) %>% 
+  as.data.frame(col.names = c("n", "N")) %>% 
+  mutate(p = round(100 * n / N))
+
+tmp
+```
+
+The proportion of samples in a cluster depends on the lineage:
+
+```{r}
+tmp %>% 
+  filter(n > 0) %>% 
+  select(-p) %>% 
+  mutate(N = N - n) %>% 
+  as.matrix() %>% 
+  fisher.test()
+```
+
+### Risk of being in a cluster
+
+The risk of being in a cluster (corresponds to the 2nd part of the 3rd paragraph
+of the `Transmission` section in the ms):
+
+```{r}
+Anova(glm(cluster ~ prison + alcohol + homeless + drugs, binomial, bmg))
+exp(coef(glm(cluster ~ prison + alcohol + homeless + drugs, binomial, bmg)))
+Anova(glm(cluster ~ sex + born + prison + alcohol + homeless + drugs, binomial, bmg))
+Anova(glm(cluster ~ sex + born + prison + alcohol + homeless + drugs, binomial, filter(bmg, born != "os2")))
+Anova(glm(cluster ~ born + prison + alcohol + homeless + drugs, binomial, bmg))
+Anova(glm(cluster ~ born + prison + alcohol + homeless + drugs, binomial, filter(bmg, born != "os2")))
+```
+
+The clustered ordered from biggest to smallest (`n` being the number of samples
+in the cluster):
+
+```{r}
+bmg %>% 
+  group_by(cluster_number) %>% 
+  tally() %>% 
+  arrange(desc(n))
+```
+
+### Figure 2
+
+The function below is used to generate Figure 2:
+
+```{r}
+plot_clusters <- function(x, l, cex = .5, col = 4) {
+  x %>%
+    filter(!cluster) %$% 
+    plot(date, chronorder, cex = cex, axes = FALSE, ann = FALSE)
+  
+  x %>% 
+    filter(cluster) %>% 
+    group_split(chronorder) %>% 
+    walk(~ lines(.x$date, .x$chronorder, col = "red", type = "o", cex = cex))
+  
+  yrs <- 2009:2019
+  axis(1, ymd(paste(yrs, "01 01")), yrs)
+  text(ymd(20110101), 1000, paste("lineage", l))
+}
+```
+
+Let's make Figure 2:
+
+```{r fig.height = 2 * 3.5, fig.width  = 2 * 4.24725}
+opar <- par(mfrow = c(2, 2), cex = 1)
+walk(1:4, ~ plot_clusters(bmg[bmg$lineage == .x, ], .x))
+par(opar)
+```
+
+### Risk of another genomically related case within 2 years, Marc's way
+
+This function adds a variable `within2years` to a dataframe that specifies
+whether there is a case that follows within 2 years:
+
+```{r}
+compute_next_case_within_2_years <- function(df) {
+  df %>% 
+    arrange(date) %>% 
+    mutate(nextcase = c(as.integer(diff(date)), NA)) %>% 
+    filter(! is.na(nextcase)) %>% 
+    mutate(within2years = nextcase < 2 * 365)
+}
+```
+
+Let's prepare the data for the analysis:
+
+```{r}
+bmg_w2y <- bmg %>% 
+  filter(cluster) %>% 
+  filter(date < max(bmg$date) - 2 * 365) %>%# pull(cluster_number) %>% unique() %>% length()
+  group_by(cluster_number) %>% 
+  group_map(~ compute_next_case_within_2_years(.x)) %>% 
+  bind_rows()
+```
+
+I don't seem to find the same results as Tim regarding the risk factor for
+another genomically related case being diagnosed with 2 years:
+
+```{r}
+bmg_w2y %$% 
+  glm(within2years ~ sex + (born == "uk") + prison + alcohol + homeless +
+        drugs + as.factor(lineage)) %>% 
+  Anova()
+```
+
+Same with a simple `summary()`:
+
+```{r}
+bmg_w2y %$% 
+  glm(within2years ~ sex + (born == "uk") + prison + alcohol + homeless +
+        drugs + as.factor(lineage)) %>% 
+  summary()
+```
+
+### Risk of another genomically related case within 2 years, Tim's way
+
+Adding the clusters of 1:
+
+```{r}
+bmg_w2y_tim <- bmg %>% 
+  filter(! cluster) %>% 
+  filter(date < max(bmg$date) - 2 * 365) %>% 
+  mutate(nextcase = as.integer(NA), within2years = FALSE) %>% 
+  bind_rows(bmg_w2y)
+```
+
+Re-running the previous 2 analyses:
+
+```{r}
+bmg_w2y_tim %$% 
+  glm(within2years ~ sex + (born == "uk") + prison + alcohol + homeless +
+        drugs + as.factor(lineage)) %>% 
+  Anova()
+```
+
+And:
+
+```{r}
+bmg_w2y_tim %$% 
+  glm(within2years ~ sex + (born == "uk") + prison + alcohol + homeless +
+        drugs + as.factor(lineage)) %>% 
+  summary()
+```
+
+```{r}
+bmg_w2y_tim %$% 
+  glm(within2years ~ sex + born + prison + alcohol + homeless +
+        drugs + as.factor(lineage)) %>% 
+  Anova()
+```
+
+
+### Zero-inflated Poisson regression
+
+This is an alternative way of looking at it. Instead of computing presence /
+absence data per individual, we compute average rate per cluster (i.e. number of
+case / duration). And then we can relate this computed rate to risk factors. The
+advantage here is that we don't need to exclude the sample that were reported
+during the last 2 years. First we need to prepare the data for the analysis:
+
+```{r}
+bmg_zip <- bmg %>% 
+  mutate(duration = as.integer(max(bmg$date) - start)) %>% 
+  select(cluster_number, duration, lineage) %>% 
+  unique() %>% 
+  left_join(tally(group_by(bmg, cluster_number)), "cluster_number") %>% 
+  mutate(n = n - 1) %>% 
+  filter(duration > 0)
+
+bmg_zip
+```
+
+This function will be used to generate the estimates:
+
+```{r}
+estimates <- function(x) {
+  cbind(est = coef(x), confint(x)) %>% 
+    as.data.frame() %>% 
+    tibble::rownames_to_column()
+}
+```
+
+Here is the analysis that consists in fitting a zero-inflated Poisson regression
+(forced to go through the origin) to the data per lineage:
+
+```{r}
+rate_estimates <- map(1:4, function(x)
+                             zeroinfl(n ~ -1 + duration | -1 + duration,
+                                      filter(bmg_zip, lineage == x))) %>% 
+  setNames(paste("lineage", 1:4)) %>% 
+  map_dfr(estimates) %>% 
+  group_split(rowname, .keep = FALSE) %>% 
+  map2(c(function(x) exp(365 * x), function(x) exp(365 * x)/(1 + exp(365 * x))), function(y, f) f(y)) %>% 
+  setNames(c("count_duration", "zero_duration"))
+```
+
+This function plot the rate estimates per lineage:
+
+```{r}
+plot_estimates <- function(x, ylim, ylab, y, length = .03) {
+  with(x, {
+    plot(1:4, est, xlim = c(.5, 4.5), ylim = ylim,
+         xlab = NA, ylab = ylab, axes = FALSE, col = 4)
+    arrows(1:4, `2.5 %`, 1:4, `97.5 %`, length, 90, 3, col = 4)
+    text(1:4, y, paste("lineage", 1:4))
+    axis(2)
+  })
+}
+```
+
+The estimates of the rate of starting a chain of transmission (left) and rate of
+transmission in a chain (right), per lineage:
+
+```{r fig.width  = 2 * 4.24725}
+opar <- par(mfrow = 1:2)
+plot_estimates(rate_estimates$zero_duration, c(.5, .6),
+               "probability of starting a chain (/year)", .5)
+plot_estimates(rate_estimates$count_duration, c(.8, 1.2), "growth rate (/year)", .8)
+par(opar)
+```
+
+To explain these differences we should look at how the lineages are different in
+terms of risk factor.
+
+### Survival analysis
+
+#### Figure 3 on Kaplan-Meier estimates
+
+This is a third option of looking at the same thing. Now, instead of looking at
+the presence / absence of another case within 2 years as for the first option,
+we compute the time to the next case. Here a tuning of the `polygon()` that can
+make "staircase" style:
+
+```{r}
+polygon2 <- function(x, l, u, ...) {
+  n <- length(x)
+  x <- c(x[1], rep(x[-1], each = 2))
+  l <- c(rep(l[-n], each = 2), l[n])
+  u <- c(rep(u[-n], each = 2), u[n])
+  polygon(c(x, rev(x)), 1 - c(l, rev(u)), border = NA, ...)
+}
+```
+
+Here is a function to plot 1 - survival:
+
+```{r}
+plot_surv <- function(x, col, ...) {
+  with(x, {
+    plot(time, 1 - surv, type = "s", xlim = c(0, 2 * 365.25), ylim = 0:1,
+         xlab = "time (days)", col = col, lwd = 2,
+         ylab = "probability", ...)
+    polygon2(time, lower, upper, col = adjustcolor(col, .2))
+  })
+}
+```
+
+Here is the equivalent but adding a line:
+
+```{r}
+lines_surv <- function(x, col) {
+  with(x, {
+    lines(time, 1 - surv, col = col, lwd = 2, type = "s")
+    polygon2(time, lower, upper, col = adjustcolor(col, .2))
+  })
+}
+```
+
+Kaplan-Meier curves:
+
+```{r fig.height = 2 * 3.5, fig.width  = 2 * 4.24725}
+opar <- par(mfrow = c(2, 2), cex = 1)
+
+# 1. Kaplan-Meier fits by social risk factor:
+groups <- c("prison", "alcohol", "homeless", "drugs", "no_other_factor")
+km_rf <- groups %>%
+  map(~ survfit(Surv(time, status) ~ 1, data = bmg[bmg[[.x]], ])) %>% 
+  setNames(groups)
+cols <- c("#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3", "#a6d854")
+plot_surv(km_rf[[1]], cols[1])
+walk(2:5, ~ lines_surv(km_rf[[.x]], cols[.x]))
+abline(v = 365.25, lty = 2)
+legend("topleft", legend = c(str_replace_all(groups, "_", " ")[-5], "none"),
+       lwd = 2, lty = 1, col = cols, bty = "n")
+
+# 2. Kaplan-Meier fits by place of birth:
+groups <- na.exclude(unique(bmg$born))
+km_born <- groups %>%
+  map(~ survfit(Surv(time, status) ~ 1, data = bmg[bmg[["born"]] == .x, ])) %>% 
+  setNames(groups)
+cols <- c("#66c2a5", "#fc8d62", "#8da0cb")
+plot_surv(km_born[[1]], cols[1], axes = FALSE)
+walk(2:3, ~ lines_surv(km_born[[.x]], cols[.x]))
+abline(v = 365.25, lty = 2)
+legend("topleft", legend = c("entered UK > 2 years before",
+                             "entered UK < 2 years before",
+                             "UK born"), lwd = 2, lty = 1, col = cols,
+       box.col = "white", bg = "white")
+axis(1); axis(2)
+
+# 3. Kaplan-Meier fits by number of social risk factors:
+groups <- 0:3
+km_born <- groups %>%
+  map(~ survfit(Surv(time, status) ~ 1, data = bmg[bmg[["srf"]] == .x, ])) %>% 
+  setNames(groups)
+cols <- c("#fed98e", "#fe9929", "#d95f0e", "#993404")
+plot_surv(km_born[[1]], cols[1])
+walk(2:4, ~ lines_surv(km_born[[.x]], cols[.x]))
+abline(v = 365.25, lty = 2)
+legend("topleft", legend = paste(groups, "SRF"),
+       lwd = 2, lty = 1, col = cols, bty = "n")
+
+# 4. Kaplan-Meier fits by lineage:
+groups <- 1:4
+km_lineage <- groups %>%
+  map(~ survfit(Surv(time, status) ~ 1, data = bmg[bmg[["lineage"]] == .x, ])) %>% 
+  setNames(groups)
+cols <- c("#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3")
+plot_surv(km_lineage[[1]], cols[1])
+walk(2:4, ~ lines_surv(km_lineage[[.x]], cols[.x]))
+abline(v = 365.25, lty = 2)
+legend("topleft", legend = paste("lineage", groups),
+       lwd = 2, lty = 1, col = cols, bty = "n")
+
+par(opar)
+```
+
+#### With Tim's data
+
+```{r}
+tim_data <- "for_kaplanmeier.csv" %>%
+  read.csv() %>% 
+  as_tibble() %>% 
+  select(cluster_number, firstsample, imstat, srf, SR, hmp, nfa, drugs, etoh, pul) %>% 
+  mutate_at("firstsample", dmy)
+```
+
+```{r}
+cluster_size <- tim_data %>% 
+  group_by(cluster_number) %>% 
+  tally()
+```
+
+```{r}
+cluster_start <- tim_data %>% 
+  group_by(cluster_number) %>% 
+  summarise(clusterstart = min(firstsample))
+```
+
+#### Estimates and tests
+
+At least one social risk factor at 1 and 2 years:
+
+```{r}
+map_dfr(1:2,
+        ~ 1 - unlist(summary(survfit(Surv(time, status) ~ 1,
+                                     data = filter(bmg, ! no_other_factor)),
+                             times = .x * 365.25)[c("lower", "surv", "upper")]))
+```
+
+UK-born at 1 year:
+
+```{r}
+1 - unlist(summary(survfit(Surv(time, status) ~ 1, data = filter(bmg, born == "uk")),
+                   times = 365.25)[c("lower", "surv", "upper")])
+```
+
+Alcohol and drug at 1 year:
+
+```{r}
+map_dfr(c("alcohol", "drugs"),
+        ~ 1 - unlist(summary(survfit(Surv(time, status) ~ 1, data = bmg[bmg[[.x]], ]),
+                             times = 365.25)[c("lower", "surv", "upper")]))
+```
+
+Number of social risk factors:
+
+```{r}
+map_dfr(0:3, ~ 1 - unlist(summary(survfit(Surv(time, status) ~ 1,
+                                          data = filter(bmg, srf == .x)),
+                   times = 365.25)[c("lower", "surv", "upper")]))
+```
+
+Corresponding log-rank p-values:
+
+```{r}
+survdiff(Surv(time, status) ~ as.factor(srf), data = filter(bmg, srf < 4))
+```
+
+Lineage:
+
+```{r}
+map_dfr(1:4, ~ 1 - unlist(summary(survfit(Surv(time, status) ~ 1,
+                                          data = filter(bmg, lineage == .x)),
+                   times = 365.25)[c("lower", "surv", "upper")]))
+```
+
+Corresponding log-rank p-values:
+
+```{r}
+survdiff(Surv(time, status) ~ as.factor(lineage),
+         data = filter(bmg, ! is.na(lineage)))
+```
+
+Log-rank p-values testing gender differences:
+
+```{r}
+survdiff(Surv(time, status) ~ sex, data = bmg)
+```
+
+### Cox proportional hazard model
+
+```{r}
+m <- coxph(Surv(time, status) ~ sex + born + pul + prison + alcohol + homeless + drugs + lineage + pul, bmg_w2y_tim)
+
+summary(m)
+```
+
+```{r}
+summary(coxph(Surv(time, status) ~ sex + born + pul + prison + alcohol + homeless + drugs + lineage + pul, bmg_w2y_tim))
+summary(coxph(Surv(time, status) ~ sex + born + pul + prison + alcohol + homeless + drugs + lineage + pul + born:lineage, bmg_w2y_tim))
+```
+
+```{r}
+summary(coxph(Surv(time, status) ~ sex + born + pul + srf + as.factor(lineage), bmg_w2y_tim))
+summary(coxph(Surv(time, status) ~ sex + born + pul + srf + as.factor(lineage) + born:as.factor(lineage), bmg_w2y_tim))
+```
+
